@@ -21,8 +21,21 @@ def hashear_contrasena(password: str) -> str:
 def verificar_contrasena(password_plana: str, password_hasheada: str) -> bool:
     return hashear_contrasena(password_plana) == password_hasheada
 
-DATABASE_URL = "sqlite:///./finanzas.db"
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+import os
+
+# 1. Intenta leer la base de datos externa de Render. Si no existe, usa SQLite de respaldo.
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+else:
+    DATABASE_URL = "sqlite:///./finanzas.db"
+
+# 2. Configura el motor de la base de datos según corresponda
+if "postgresql" in DATABASE_URL:
+    engine = create_engine(DATABASE_URL)
+else:
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
