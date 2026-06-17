@@ -15,7 +15,7 @@ from sqlalchemy.orm import sessionmaker, Session, relationship
 # ==========================================
 # 1. CONFIGURACIÓN DE BASE DE DATOS & SEGURIDAD
 # ==========================================
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://finanzas_db_1nzc_user:gDjmzQ24ySHrGjH9mFU6Friw0S1bDVFM@dpg-d8pgv95ckfvc73cvfkag-a.virginia-postgres.render.com/finanzas_db_1nzc")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://usuario:password@localhost:5432/finanzas")
 SECRET_KEY = os.getenv("SECRET_KEY", "tu_clave_secreta_super_segura_para_desarrollo")
 ALGORITHM = "HS256"
 
