@@ -49,14 +49,14 @@ class UsuarioDB(Base):
     nombre = Column(String, nullable=False)
     email = Column(String, unique=True, index=True, nullable=False)
     password_hash = Column(String, nullable=False)
-    ciclo_inicio_dia = Column(Integer, default=1)  # Día del mes en que inicia su ciclo financiero
+    ciclo_inicio_dia = Column(Integer, default=1)
 
 class TransaccionDB(Base):
     __tablename__ = "transacciones"
     id = Column(Integer, primary_key=True, index=True)
     monto = Column(Float, nullable=False)
-    tipo = Column(String, nullable=False)  # "ingreso" o "gasto"
-    categoria = Column(String, nullable=False)  # "alimentacion", "transporte", etc.
+    tipo = Column(String, nullable=False)  # "ingreso", "gasto", "ahorro"
+    categoria = Column(String, nullable=False)  # "alimentacion", "global", etc.
     fecha = Column(DateTime, default=datetime.utcnow)
     usuario_id = Column(Integer, ForeignKey("usuarios.id"))
 
@@ -84,7 +84,7 @@ class UsuarioLogin(BaseModel):
 
 class TransaccionCrear(BaseModel):
     monto: float = Field(..., gt=0)
-    tipo: str  # "ingreso" o "gasto"
+    tipo: str  
     categoria: str
     fecha: Optional[datetime] = None
 
@@ -118,16 +118,13 @@ def obtener_usuario_por_token(token: str, db: Session = Depends(get_db)) -> Usua
 
 def obtener_rango_ciclo_actual(inicio_dia: int) -> tuple[datetime, datetime]:
     hoy = datetime.utcnow()
-    # Determinar el año y mes de inicio del ciclo actual
     if hoy.day >= inicio_dia:
         fecha_inicio = datetime(hoy.year, hoy.month, inicio_dia, 0, 0, 0)
     else:
-        # Si hoy es menor al día de corte, el ciclo empezó el mes pasado
         mes_anterior = hoy.month - 1 if hoy.month > 1 else 12
         anio_anterior = hoy.year if hoy.month > 1 else hoy.year - 1
         fecha_inicio = datetime(anio_anterior, mes_anterior, inicio_dia, 0, 0, 0)
     
-    # El ciclo termina exactamente un mes después de la fecha de inicio
     mes_fin = fecha_inicio.month + 1 if fecha_inicio.month < 12 else 1
     anio_fin = fecha_inicio.year if fecha_inicio.month < 12 else fecha_inicio.year + 1
     fecha_fin = datetime(anio_fin, mes_fin, inicio_dia, 23, 59, 59) - timedelta(days=1)
@@ -165,104 +162,83 @@ def login_usuario(usuario: UsuarioLogin, db: Session = Depends(get_db)):
 # ==========================================
 # 6. ENDPOINTS DE TRANSACCIONES & CORE
 # ==========================================
+@app.get("/transacciones/", tags=["Transacciones"])
+def listar_transacciones(token: str, db: Session = Depends(get_db)):
+    usuario = obtener_usuario_por_token(token, db)
+    fecha_inicio, fecha_fin = obtener_rango_ciclo_actual(usuario.ciclo_inicio_dia)
+    
+    # Obtener todas las transacciones históricas para el dashboard
+    return db.query(TransaccionDB).filter(TransaccionDB.usuario_id == usuario.id).all()
+
 @app.post("/transacciones/", tags=["Transacciones"])
 def crear_transaccion(transaccion: TransaccionCrear, token: str, db: Session = Depends(get_db)):
     usuario = obtener_usuario_por_token(token, db)
+    cat_clean = transaccion.categoria.lower().strip()
+    tipo_clean = transaccion.tipo.lower().strip()
+
+    # Validar alertas automáticas de presupuestos en caso de GASTOS
+    notificacion = None
+    if tipo_clean == "gasto":
+        fecha_inicio, fecha_fin = obtener_rango_ciclo_actual(usuario.ciclo_inicio_dia)
+        gastado_actual = db.query(TransaccionDB).filter(
+            TransaccionDB.usuario_id == usuario.id,
+            TransaccionDB.tipo == "gasto",
+            TransaccionDB.categoria == cat_clean,
+            TransaccionDB.fecha >= fecha_inicio,
+            TransaccionDB.fecha <= fecha_fin
+        ).all()
+        
+        total_gastado = sum(g.monto for g in gastado_actual) + transaccion.monto
+        presupuesto = db.query(PresupuestoDB).filter(
+            PresupuestoDB.categoria == cat_clean, 
+            PresupuestoDB.usuario_id == usuario.id
+        ).first()
+        
+        if presupuesto:
+            if total_gastado >= presupuesto.limite_maximo:
+                notificacion = f"⚠️ ALERTA INTERNA: ¡Has superado el 100% de tu límite en {cat_clean.capitalize()}!"
+            elif total_gastado >= (presupuesto.limite_maximo * 0.8):
+                notificacion = f"⚡ CUIDADO: Has consumido más del 80% del presupuesto de {cat_clean.capitalize()}."
+
     nueva_transaccion = TransaccionDB(
         monto=transaccion.monto,
-        tipo=transaccion.tipo.lower().strip(),
-        categoria=transaccion.categoria.lower().strip(),
+        tipo=tipo_clean,
+        categoria=cat_clean,
         fecha=transaccion.fecha if transaccion.fecha else datetime.utcnow(),
         usuario_id=usuario.id
     )
     db.add(nueva_transaccion)
     db.commit()
-    return {"mensaje": "Transacción registrada con éxito."}
+    
+    return {"mensaje": "Transacción guardada.", "notificacion": notificacion}
 
 # ==========================================
-# 7. ENDPOINTS AVANZADOS (Gráficas y Ciclos)
+# 7. ENDPOINTS AVANZADOS (Presupuestos & Gráficos)
 # ==========================================
-@app.get("/balance/mensual/", tags=["Métricas Financieras"])
-def obtener_balance_mensual(token: str, db: Session = Depends(get_db)):
-    """
-    Calcula los ingresos, gastos y ahorro acumulado del ciclo de cobro personalizado del usuario.
-    """
+@app.get("/presupuestos/", tags=["Finanzas"])
+def obtener_resumen_presupuestos(token: str, db: Session = Depends(get_db)):
     usuario = obtener_usuario_por_token(token, db)
     fecha_inicio, fecha_fin = obtener_rango_ciclo_actual(usuario.ciclo_inicio_dia)
     
+    presupuestos = db.query(PresupuestoDB).filter(PresupuestoDB.usuario_id == usuario.id).all()
     transacciones = db.query(TransaccionDB).filter(
-        TransaccionDB.usuario_id == usuario.id,
-        TransaccionDB.fecha >= fecha_inicio,
-        TransaccionDB.fecha <= fecha_fin
-    ).all()
-    
-    total_ingresos = sum(t.monto for t in transacciones if t.tipo == "ingreso")
-    total_gastos = sum(t.monto for t in transacciones if t.tipo == "gasto")
-    ahorro_neto = total_ingresos - total_gastos
-    
-    return {
-        "ciclo_periodo": {
-            "desde": fecha_inicio.strftime("%Y-%m-%d"),
-            "hasta": fecha_fin.strftime("%Y-%m-%d"),
-            "dia_corte_configurado": usuario.ciclo_inicio_dia
-        },
-        "total_ingresos": total_ingresos,
-        "total_gastos": total_gastos,
-        "ahorro_neto": ahorro_neto,
-        "estado_financiero": "Superávit (Ahorro)" if ahorro_neto >= 0 else "Déficit (Pérdida)"
-    }
-
-@app.get("/graficos/pastel/", tags=["Visualización de Datos"])
-def obtener_datos_grafico_pastel(token: str, db: Session = Depends(get_db)):
-    """
-    Procesa las categorías de gastos del ciclo actual estructuradas para Chart.js.
-    Las categorías con porcentajes de gasto inferiores al 5% se agrupan automáticamente en 'Otros'.
-    """
-    usuario = obtener_usuario_por_token(token, db)
-    fecha_inicio, fecha_fin = obtener_rango_ciclo_actual(usuario.ciclo_inicio_dia)
-    
-    # Obtener solo gastos del ciclo actual
-    gastos = db.query(TransaccionDB).filter(
         TransaccionDB.usuario_id == usuario.id,
         TransaccionDB.tipo == "gasto",
         TransaccionDB.fecha >= fecha_inicio,
         TransaccionDB.fecha <= fecha_fin
     ).all()
-    
-    gastos_por_categoria = {}
-    suma_total_gastos = 0.0
-    
-    for g in gastos:
-        gastos_por_categoria[g.categoria] = gastos_por_categoria.get(g.categoria, 0.0) + g.monto
-        suma_total_gastos += g.monto
 
-    labels = []
-    valores = []
-    monto_otros = 0.0
-    
-    if suma_total_gastos > 0:
-        for cat, monto in gastos_por_categoria.items():
-            porcentaje = (monto / suma_total_gastos) * 100
-            # Regla de negocio: Si representa menos del 5%, se agrupa en 'Otros' para limpiar la interfaz
-            if porcentaje < 5.0:
-                monto_otros += monto
-            else:
-                labels.append(cat.capitalize())
-                valores.append(round(monto, 2))
-                
-        if monto_otros > 0:
-            labels.append("Otros")
-            valores.append(round(monto_otros, 2))
+    resumen = {}
+    for p in presupuestos:
+        consumido = sum(t.monto for t in transacciones if t.categoria == p.categoria)
+        porcentaje = (consumido / p.limite_maximo) * 100 if p.limite_maximo > 0 else 0
+        resumen[p.categoria] = {
+            "limite": p.limite_maximo,
+            "consumido": consumido,
+            "porcentaje": round(porcentaje, 2)
+        }
+    return resumen
 
-    return {
-        "labels": labels,
-        "valores": valores,
-        "total_gastado_ciclo": round(suma_total_gastos, 2)
-    }
-
-# ==========================================
-# 8. CONFIGURACIÓN DE CONFIGS ADICIONALES
-# ==========================================
 @app.post("/presupuestos/", tags=["Finanzas"])
 def configurar_presupuesto(config: PresupuestoConfig, token: str, db: Session = Depends(get_db)):
     usuario = obtener_usuario_por_token(token, db)
@@ -277,16 +253,33 @@ def configurar_presupuesto(config: PresupuestoConfig, token: str, db: Session = 
         db_presupuesto.limite_maximo = config.limite_maximo
     else:
         db_presupuesto = PresupuestoDB(categoria=cat_clean, limite_maximo=config.limite_maximo, usuario_id=usuario.id)
-        db_add(db_presupuesto)
+        db.add(db_presupuesto)
         
     db.commit()
-    return {"mensaje": "Presupuesto guardado."}
+    return {"mensaje": "Presupuesto guardado con éxito."}
 
-@app.patch("/usuarios/ciclo-cobro", tags=["Configuración de Usuario"])
-def actualizar_ciclo_cobro(dia: int, token: str, db: Session = Depends(get_db)):
-    if dia < 1 or dia > 31:
-        raise HTTPException(status_code=400, detail="El día debe estar entre 1 y 31.")
+@app.get("/graficos/pastel/", tags=["Visualización de Datos"])
+def obtener_datos_grafico_pastel(token: str, db: Session = Depends(get_db)):
     usuario = obtener_usuario_por_token(token, db)
-    usuario.ciclo_inicio_dia = dia
+    fecha_inicio, fecha_fin = obtener_rango_ciclo_actual(usuario.ciclo_inicio_dia)
+    
+    gastos = db.query(TransaccionDB).filter(
+        TransaccionDB.usuario_id == usuario.id,
+        TransaccionDB.tipo == "gasto",
+        TransaccionDB.fecha >= fecha_inicio,
+        TransaccionDB.fecha <= fecha_fin
+    ).all()
+    
+    resumen_pastel = {}
+    for g in gastos:
+        resumen_pastel[g.categoria] = resumen_pastel.get(g.categoria, 0.0) + g.monto
+        
+    return resumen_pastel
+
+@app.post("/reiniciar/", tags=["Mantenimiento"])
+def reiniciar_datos_usuario(token: str, db: Session = Depends(get_db)):
+    usuario = obtener_usuario_por_token(token, db)
+    db.query(TransaccionDB).filter(TransaccionDB.usuario_id == usuario.id).delete()
+    db.query(PresupuestoDB).filter(PresupuestoDB.usuario_id == usuario.id).delete()
     db.commit()
-    return {"mensaje": "Ciclo financiero actualizado."}
+    return {"mensaje": "Datos vaciados correctamente."}
